@@ -31,7 +31,13 @@ DEVICE=caprip PHYSBASE=${PHYSBASE:-0xc0000000} MEMSIZE=${MEMSIZE:-0x80000000} \
 # --- 2. xnu payload (segments + ADT + cmdline, chained fixups resolved) ---
 # cpus=4: the Gold cluster only. sweettouch/sweethw off for the first boot;
 # the console on the panel is the whole point of this milestone.
-CMD="debug=0xc serial=3 cpus=${CPUS:-4} keepsyms=1 -noprogress rd=md0 sweettouch=0 sweethw=0 sweetfb_noconsole=0 sweetfb_hz=30"
+# ROOTDEV picks what xnu mounts as /:
+#   md0        -- mockfs memory disk (the heartbeat-only milestone build)
+#   emmcroot0  -- bsd/dev/sweet_emmc.c, the real HFSX volume on eMMC
+# IOFindBSDRoot matches the rd= string, so this is the only switch needed;
+# the /sweet-emmc ADT node is already emitted for DEVICE=caprip.
+ROOTDEV=${ROOTDEV:-md0}
+CMD="debug=0xc serial=3 cpus=${CPUS:-4} keepsyms=1 -noprogress rd=$ROOTDEV sweettouch=0 sweethw=0 sweetfb_noconsole=0 sweetfb_hz=30"
 python3 tools/mkpayload.py "$KERNEL" "$OUT/caprip.adt" "$OUT/payload.bin" \
     --cmdline "$CMD" ${RAMDISK:+--ramdisk "$RAMDISK"}
 
@@ -40,7 +46,9 @@ python3 tools/mkpayload.py "$KERNEL" "$OUT/caprip.adt" "$OUT/payload.bin" \
 # geometry from -- a wrong stride here skews the entire iOS surface.
 # SCALE=2: at 720 px, SCALE 3 leaves only 29 columns and clips the
 # diagnostics that make a failed boot readable.
-EXTRA_CFLAGS="-DFB_W=720 -DFB_H=1600 -DFB_STRIDE=2880 -DSCALE=2 -DNO_UFS_PROBE" \
+# SHIM_EXTRA appends to the shim flags; -DEMMC_PROBE builds the storage
+# bring-up image, which reports on the panel and never loads xnu.
+EXTRA_CFLAGS="-DFB_W=720 -DFB_H=1600 -DFB_STRIDE=2880 -DSCALE=2 -DNO_UFS_PROBE ${SHIM_EXTRA:-}" \
     MKBOOTIMG=/bin/true shim/build.sh >/dev/null 2>&1 || true
 [ -s shim/out/Image ] || { echo "error: shim did not build; run shim/build.sh to see why" >&2; exit 1; }
 cp shim/out/Image "$OUT/shim.bin"
