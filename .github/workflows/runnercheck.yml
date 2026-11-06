@@ -1,0 +1,8 @@
+name: runnercheck
+on:
+  workflow_dispatch:
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ubuntu runner acquired"; uname -a
