@@ -55,8 +55,35 @@
 /* Qualcomm v5 vendor block (Linux sdhci_msm_v5_offset). */
 #define CORE_VENDOR_SPEC	0x20c
 #define CORE_PWRCTL_STATUS	0x240
+#define CORE_PWRCTL_MASK	0x244
+#define CORE_PWRCTL_CLEAR	0x248
 #define CORE_PWRCTL_CTL		0x24c
 #define CORE_MCI_VERSION	0x318
+
+/* core_pwrctl_status: what the hardware is asking software to do. */
+#define PWRCTL_BUS_OFF		(1u << 0)
+#define PWRCTL_BUS_ON		(1u << 1)
+#define PWRCTL_IO_LOW		(1u << 2)
+#define PWRCTL_IO_HIGH		(1u << 3)
+#define PWRCTL_REQ_MASK		0x0fu
+/* core_pwrctl_ctl: how software answers. */
+#define PWRCTL_BUS_SUCCESS	(1u << 0)
+#define PWRCTL_BUS_FAIL		(1u << 1)
+#define PWRCTL_IO_SUCCESS	(1u << 2)
+#define PWRCTL_IO_FAIL		(1u << 3)
+
+/* SDHCI_POWER_CONTROL */
+#define POWER_ON		(1u << 0)
+#define POWER_180		(0x5u << 1)	/* bus voltage select 1.8 V */
+#define POWER_300		(0x6u << 1)
+#define POWER_330		(0x7u << 1)
+
+/* SDHCI_CAPABILITIES */
+#define CAP_BASE_CLK_SHIFT	8
+#define CAP_BASE_CLK_MASK	0xffu
+#define CAP_VDD_330		(1u << 24)
+#define CAP_VDD_300		(1u << 25)
+#define CAP_VDD_180		(1u << 26)
 
 /* PRESENT_STATE */
 #define STATE_CMD_INHIBIT	(1u << 0)
@@ -167,6 +194,132 @@ static uint32_t wait_int(uint32_t mask, uint32_t ms)
 static uint32_t last_err;
 
 /*
+ * Reset just the CMD and DAT circuits. Never RESET_ALL: that is one of the
+ * three writes that raise a Qualcomm power request, and it would also undo
+ * the bus power this driver has to set up.
+ */
+static void reset_cmd_dat(void)
+{
+	wr8(SDHCI_SOFTWARE_RESET, RESET_CMD | RESET_DATA);
+	for (int i = 0; i < 10000; i++) {
+		if (!(rd8(SDHCI_SOFTWARE_RESET) & (RESET_CMD | RESET_DATA)))
+			break;
+		udelay(10);
+	}
+}
+
+/*
+ * Service one Qualcomm power request, polled.
+ *
+ * Writing SDHCI_POWER_CONTROL (or HOST_CONTROL2, or SOFTWARE_RESET with
+ * RESET_ALL) makes the hardware raise a request in core_pwrctl_status and
+ * then stall until software answers. Linux does this from the pwr_irq
+ * handler; there are no interrupts here, so poll instead.
+ *
+ * The answer is just an ack. On a phone the rails behind the request are
+ * PMIC regulators that Linux would switch through the regulator framework,
+ * which does not exist here -- the bet is that the bootloader left vmmc and
+ * vqmmc enabled (Android was running moments ago, and ABL itself boots off
+ * this eMMC), so only the host controller's own power state needs changing.
+ * If that bet is wrong, CMD1 will still never see an OCR and the rails have
+ * to be driven directly over SPMI to PM6125.
+ *
+ * Returns the request that was serviced, or 0 if none appeared.
+ */
+static uint32_t pwrctl_service(uint32_t ms)
+{
+	uint64_t end = ticks() + (tick_hz() / 1000) * ms;
+	uint32_t req, ack = 0;
+
+	for (;;) {
+		req = rd32(CORE_PWRCTL_STATUS) & PWRCTL_REQ_MASK;
+		if (req)
+			break;
+		if (ticks() > end)
+			return 0;
+	}
+
+	/*
+	 * Clear first, then ack. The clear pulse can be lost if a reset races
+	 * it, so re-clear until the status register actually drops the bits
+	 * (Linux retries ten times for the same reason).
+	 */
+	for (int i = 0; i < 10; i++) {
+		wr32(CORE_PWRCTL_CLEAR, req);
+		if (!(rd32(CORE_PWRCTL_STATUS) & req))
+			break;
+		udelay(10);
+	}
+
+	if (req & (PWRCTL_BUS_ON | PWRCTL_BUS_OFF))
+		ack |= PWRCTL_BUS_SUCCESS;
+	if (req & (PWRCTL_IO_HIGH | PWRCTL_IO_LOW))
+		ack |= PWRCTL_IO_SUCCESS;
+	wr32(CORE_PWRCTL_CTL, ack);
+	return req;
+}
+
+/*
+ * Turn on SD bus power. The probe found SDHCI_POWER_CONTROL == 0 after the
+ * bootloader handed off, which is why every command timed out: an unpowered
+ * card answers nothing.
+ */
+static uint32_t power_on(void)
+{
+	uint32_t caps = rd32(SDHCI_CAPABILITIES);
+	uint8_t v;
+
+	/* caprip reports 1.8 V only (caps bit 26), slot type "embedded". */
+	if (caps & CAP_VDD_180)
+		v = POWER_180;
+	else if (caps & CAP_VDD_300)
+		v = POWER_300;
+	else
+		v = POWER_330;
+
+	wr8(SDHCI_POWER_CONTROL, v);		/* select voltage, still off */
+	udelay(100);
+	wr8(SDHCI_POWER_CONTROL, v | POWER_ON);	/* raises the pwr request */
+	return pwrctl_service(500);
+}
+
+/*
+ * Set the card clock. SDHCI 3.0 ten-bit divided mode: f = base / (2 * n),
+ * n == 0 meaning "base, undivided".
+ *
+ * sdhci-msm marks the capabilities clock base broken in Linux, so this is
+ * only as good as that field -- but it reads 200 MHz here, which is the
+ * right order for the SDCC core clock, and init only needs to land under
+ * 400 kHz rather than hit it exactly.
+ */
+static void set_clock(uint32_t want_hz)
+{
+	uint32_t caps = rd32(SDHCI_CAPABILITIES);
+	uint32_t base = ((caps >> CAP_BASE_CLK_SHIFT) & CAP_BASE_CLK_MASK) * 1000000u;
+	uint32_t n = 0;
+	uint16_t v;
+
+	if (!base)
+		base = 200000000u;
+	if (want_hz < base)
+		for (n = 1; n < 0x3ff; n++)
+			if (base / (2 * n) <= want_hz)
+				break;
+
+	wr16(SDHCI_CLOCK_CONTROL, 0);		/* stop the clock to retime */
+	v = (uint16_t)(((n & 0xff) << 8) | (((n >> 8) & 0x3) << 6) |
+		       CLK_INTERNAL_EN);
+	wr16(SDHCI_CLOCK_CONTROL, v);
+	for (int i = 0; i < 10000; i++) {
+		if (rd16(SDHCI_CLOCK_CONTROL) & CLK_INTERNAL_STABLE)
+			break;
+		udelay(10);
+	}
+	wr16(SDHCI_CLOCK_CONTROL, v | CLK_CARD_EN);
+	udelay(1000);
+}
+
+/*
  * Issue one command. resp[] takes up to four response words.
  * 0 on success, -1 on timeout, -2 on a controller error.
  */
@@ -188,20 +341,20 @@ static int cmd(uint8_t idx, uint32_t arg, uint8_t flags, uint32_t *resp)
 
 	s = wait_int(INT_CMD_COMPLETE, 1000);
 	if (!s) {
+		/*
+		 * Timed out. The command is still latched, so CMD_INHIBIT
+		 * stays set and every later command fails before it is even
+		 * issued -- which is how the first probe turned one CMD13
+		 * timeout into "inhibit never cleared" on CMD0. Clear it.
+		 */
 		last_err = 0x70000000u;		/* no CMD_COMPLETE */
+		reset_cmd_dat();
 		return -1;
 	}
 	if (s & INT_ERROR) {
 		last_err = s;
 		wr32(SDHCI_INT_STATUS, INT_ALL);
-		/* Targeted reset only; RESET_ALL would need the pwr handshake. */
-		wr8(SDHCI_SOFTWARE_RESET, RESET_CMD | RESET_DATA);
-		for (int i = 0; i < 10000; i++) {
-			if (!(rd8(SDHCI_SOFTWARE_RESET) &
-			      (RESET_CMD | RESET_DATA)))
-				break;
-			udelay(10);
-		}
+		reset_cmd_dat();
 		return -2;
 	}
 	wr32(SDHCI_INT_STATUS, INT_CMD_COMPLETE);
@@ -295,29 +448,31 @@ int emmc_probe(void)
 		 rd32(CORE_PWRCTL_CTL));
 	con_skip();
 
-	clk = rd16(SDHCI_CLOCK_CONTROL);
-	if (!(clk & CLK_CARD_EN)) {
-		/*
-		 * Card clock is off. Re-enable it with the divider already
-		 * programmed: the input rate is a clock-framework property we
-		 * do not have here, and sdhci-msm marks the capabilities clock
-		 * base broken, so computing a divider would be guesswork.
-		 */
-		con_str("CLK", "card clock off, enabling");
-		wr16(SDHCI_CLOCK_CONTROL, clk | CLK_INTERNAL_EN);
-		for (int i = 0; i < 10000; i++) {
-			if (rd16(SDHCI_CLOCK_CONTROL) & CLK_INTERNAL_STABLE)
-				break;
-			udelay(10);
-		}
-		wr16(SDHCI_CLOCK_CONTROL,
-		     rd16(SDHCI_CLOCK_CONTROL) | CLK_CARD_EN);
-		con_hex("CLK now", rd16(SDHCI_CLOCK_CONTROL));
-	}
-
 	/* Unmask status bits; IRQ delivery (signal enable) stays off. */
 	wr32(SDHCI_INT_ENABLE, INT_ALL);
 	wr32(SDHCI_SIGNAL_ENABLE, 0);
+	/* Let the power request reach core_pwrctl_status rather than an IRQ. */
+	wr32(CORE_PWRCTL_MASK, PWRCTL_REQ_MASK);
+
+	/*
+	 * The first probe found SDHCI_POWER_CONTROL == 0: the bootloader
+	 * handed off with SD bus power off, so every command timed out
+	 * against an unpowered card. Power up, then clock, then identify.
+	 */
+	clk = rd16(SDHCI_CLOCK_CONTROL);
+	con_hex2("PRE", "clk=", clk, "pwr=", rd8(SDHCI_POWER_CONTROL));
+
+	reset_cmd_dat();
+	uint32_t req = power_on();
+	con_hex2("POWER", "req=", req, "pwr=", rd8(SDHCI_POWER_CONTROL));
+	con_hex2("PWRIRQ", "stat=", rd32(CORE_PWRCTL_STATUS), "ctl=",
+		 rd32(CORE_PWRCTL_CTL));
+	udelay(10000);			/* rails settle; spec wants 74 clocks */
+
+	set_clock(400000);		/* identification speed */
+	con_hex2("CLK", "ctl=", rd16(SDHCI_CLOCK_CONTROL), "pstate=",
+		 rd32(SDHCI_PRESENT_STATE));
+	con_skip();
 
 	/*
 	 * First try the card where the bootloader left it -- already
