@@ -1,0 +1,775 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,7 +104,8 @@
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_emmc.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,10 +784,28 @@
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d
+", rootName, major(*root), minor(*root));
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++//
++//	SWEET: root on a GPT partition of the internal eMMC (bsd/dev/sweet_emmc.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int sweet_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = sweet_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: SWEET eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d
+", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_emmc.c
+@@ -0,0 +1,724 @@
++/*
++ * SWEET internal eMMC root device (read-only).
++ *
++ * Qualcomm SDHCI host ("qcom,sdhci-msm-v5"), the controller the bootloader
++ * itself boots from. Unlike the UFS driver next door, this one does not
++ * inherit a live link: measured on caprip (Moto G30, SM6115), ABL hands off
++ * with SD bus power OFF and the card clock disabled, so the card answers
++ * nothing until it is powered and identified from idle. The sequence below
++ * was brought up and verified in the boot shim first, against this exact
++ * hardware.
++ *
++ * Deliberately narrow:
++ *   - PIO only. No ADMA, no DMA descriptors, and therefore no contiguous
++ *     DMA allocation: blocks are read straight out of the data port into
++ *     the caller's buffer.
++ *   - No CQE, no tuning, no HS200/HS400, no voltage switch. Identification
++ *     speed (400 kHz) is kept for data transfer too; a root filesystem is
++ *     read often but a bring-up wants determinism over throughput.
++ *   - Read only. Nothing here can write to the device.
++ *
++ * Power handshake: writing SDHCI_POWER_CONTROL (also HOST_CONTROL2, and
++ * SOFTWARE_RESET with RESET_ALL) makes the hardware raise a request in
++ * core_pwrctl_status and stall until software acks it. Linux services that
++ * from its pwr_irq handler; this driver polls instead, because it runs
++ * before interrupt plumbing exists. The PMIC rails behind the request are
++ * left as the bootloader set them -- ABL boots off this eMMC, so vmmc and
++ * vqmmc are already enabled, which is why no regulator programming over
++ * SPMI is needed. RESET_ALL is never written.
++ *
++ * Root on it with rd=emmcroot0; the partition is chosen with emmcroot=
++ * (default "userdata").
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++/* Standard SDHCI registers (SD Host Controller Simplified Spec 3.00). */
++#define SDHCI_BLOCK_SIZE        0x04    /* 16 */
++#define SDHCI_BLOCK_COUNT       0x06    /* 16 */
++#define SDHCI_ARGUMENT          0x08    /* 32 */
++#define SDHCI_TRANSFER_MODE     0x0c    /* 16 */
++#define SDHCI_COMMAND           0x0e    /* 16 */
++#define SDHCI_RESPONSE          0x10    /* 4 x 32 */
++#define SDHCI_BUFFER            0x20    /* 32, PIO data port */
++#define SDHCI_PRESENT_STATE     0x24    /* 32 */
++#define SDHCI_HOST_CONTROL      0x28    /* 8  */
++#define SDHCI_POWER_CONTROL     0x29    /* 8  */
++#define SDHCI_CLOCK_CONTROL     0x2c    /* 16 */
++#define SDHCI_TIMEOUT_CONTROL   0x2e    /* 8  */
++#define SDHCI_SOFTWARE_RESET    0x2f    /* 8  */
++#define SDHCI_INT_STATUS        0x30    /* 32 */
++#define SDHCI_INT_ENABLE        0x34    /* 32 */
++#define SDHCI_SIGNAL_ENABLE     0x38    /* 32 */
++#define SDHCI_CAPABILITIES      0x40    /* 32 */
++#define SDHCI_HOST_VERSION      0xfe    /* 16 */
++
++/* Qualcomm v5 vendor block (Linux sdhci_msm_v5_offset). */
++#define CORE_PWRCTL_STATUS      0x240
++#define CORE_PWRCTL_MASK        0x244
++#define CORE_PWRCTL_CLEAR       0x248
++#define CORE_PWRCTL_CTL         0x24c
++
++#define PWRCTL_BUS_OFF          (1u << 0)
++#define PWRCTL_BUS_ON           (1u << 1)
++#define PWRCTL_IO_LOW           (1u << 2)
++#define PWRCTL_IO_HIGH          (1u << 3)
++#define PWRCTL_REQ_MASK         0x0fu
++#define PWRCTL_BUS_SUCCESS      (1u << 0)
++#define PWRCTL_IO_SUCCESS       (1u << 2)
++
++#define STATE_CMD_INHIBIT       (1u << 0)
++#define STATE_DAT_INHIBIT       (1u << 1)
++
++#define INT_CMD_COMPLETE        (1u << 0)
++#define INT_XFER_COMPLETE       (1u << 1)
++#define INT_BUF_READ_RDY        (1u << 5)
++#define INT_ERROR               (1u << 15)
++#define INT_ALL                 0xffffffffu
++
++#define CLK_INTERNAL_EN         (1u << 0)
++#define CLK_INTERNAL_STABLE     (1u << 1)
++#define CLK_CARD_EN             (1u << 2)
++
++#define RESET_CMD               (1u << 1)
++#define RESET_DATA              (1u << 2)
++
++#define CMD_RESP_NONE           0x00
++#define CMD_RESP_136            0x01
++#define CMD_RESP_48             0x02
++#define CMD_RESP_48_BUSY        0x03
++#define CMD_CRC_CHECK           0x08
++#define CMD_IDX_CHECK           0x10
++#define CMD_DATA_PRESENT        0x20
++
++#define TRNS_READ               (1u << 4)
++
++#define POWER_ON                (1u << 0)
++#define POWER_180               (0x5u << 1)
++#define POWER_300               (0x6u << 1)
++#define POWER_330               (0x7u << 1)
++#define CAP_VDD_330             (1u << 24)
++#define CAP_VDD_300             (1u << 25)
++#define CAP_VDD_180             (1u << 26)
++
++#define MMC_RCA                 1u
++#define EMMC_BLOCK              512u
++#define GPT_ENTRY_NAME_LEN      36      /* UTF-16LE code units */
++
++static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
++static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
++
++static struct {
++	vm_offset_t regs;
++	uint64_t    first_block;        /* partition start, in 512-byte LBAs */
++	uint64_t    nblocks;            /* partition length, in 512-byte LBAs */
++	uint32_t    secsize;
++	int         bmajor, cmajor;
++	dev_t       bdev;
++	bool        ready;
++} se;
++
++static inline uint8_t rd8(uint32_t o)
++{
++	return *(volatile uint8_t *)(se.regs + o);
++}
++static inline uint16_t rd16(uint32_t o)
++{
++	return *(volatile uint16_t *)(se.regs + o);
++}
++static inline uint32_t rd32(uint32_t o)
++{
++	return *(volatile uint32_t *)(se.regs + o);
++}
++static inline void wr8(uint32_t o, uint8_t v)
++{
++	*(volatile uint8_t *)(se.regs + o) = v;
++}
++static inline void wr16(uint32_t o, uint16_t v)
++{
++	*(volatile uint16_t *)(se.regs + o) = v;
++}
++static inline void wr32(uint32_t o, uint32_t v)
++{
++	*(volatile uint32_t *)(se.regs + o) = v;
++}
++
++static uint64_t
++deadline_ms(uint32_t ms)
++{
++	uint64_t d;
++
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &d);
++	return mach_absolute_time() + d;
++}
++
++static int
++wait_clear(uint32_t mask, uint32_t ms)
++{
++	uint64_t end = deadline_ms(ms);
++
++	while (rd32(SDHCI_PRESENT_STATE) & mask) {
++		if (mach_absolute_time() > end) {
++			return -1;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++/* Returns the status word, or 0 on timeout. */
++static uint32_t
++wait_int(uint32_t mask, uint32_t ms)
++{
++	uint64_t end = deadline_ms(ms);
++
++	for (;;) {
++		uint32_t s = rd32(SDHCI_INT_STATUS);
++
++		if (s & (mask | INT_ERROR)) {
++			return s;
++		}
++		if (mach_absolute_time() > end) {
++			return 0;
++		}
++		delay(1);
++	}
++}
++
++/*
++ * Reset only the CMD and DAT circuits. Never RESET_ALL: it is one of the
++ * three writes that raise a power request, and it would undo the bus power
++ * this driver sets up.
++ */
++static void
++reset_cmd_dat(void)
++{
++	wr8(SDHCI_SOFTWARE_RESET, RESET_CMD | RESET_DATA);
++	for (int i = 0; i < 10000; i++) {
++		if (!(rd8(SDHCI_SOFTWARE_RESET) & (RESET_CMD | RESET_DATA))) {
++			break;
++		}
++		delay(10);
++	}
++}
++
++/* Polled equivalent of Linux's sdhci_msm pwr_irq handler. */
++static uint32_t
++pwrctl_service(uint32_t ms)
++{
++	uint64_t end = deadline_ms(ms);
++	uint32_t req, ack = 0;
++
++	for (;;) {
++		req = rd32(CORE_PWRCTL_STATUS) & PWRCTL_REQ_MASK;
++		if (req) {
++			break;
++		}
++		if (mach_absolute_time() > end) {
++			return 0;
++		}
++		delay(1);
++	}
++	/* The clear pulse can be lost against a reset; retry as Linux does. */
++	for (int i = 0; i < 10; i++) {
++		wr32(CORE_PWRCTL_CLEAR, req);
++		if (!(rd32(CORE_PWRCTL_STATUS) & req)) {
++			break;
++		}
++		delay(10);
++	}
++	if (req & (PWRCTL_BUS_ON | PWRCTL_BUS_OFF)) {
++		ack |= PWRCTL_BUS_SUCCESS;
++	}
++	if (req & (PWRCTL_IO_HIGH | PWRCTL_IO_LOW)) {
++		ack |= PWRCTL_IO_SUCCESS;
++	}
++	wr32(CORE_PWRCTL_CTL, ack);
++	return req;
++}
++
++static uint32_t
++emmc_power_on(void)
++{
++	uint32_t caps = rd32(SDHCI_CAPABILITIES);
++	uint8_t v;
++
++	/* Take the voltage from the capabilities register, not an assumption:
++	 * caprip reports 1.8 V only, with slot type "embedded". */
++	if (caps & CAP_VDD_180) {
++		v = POWER_180;
++	} else if (caps & CAP_VDD_300) {
++		v = POWER_300;
++	} else {
++		v = POWER_330;
++	}
++	wr8(SDHCI_POWER_CONTROL, v);
++	delay(100);
++	wr8(SDHCI_POWER_CONTROL, v | POWER_ON);
++	return pwrctl_service(500);
++}
++
++/* SDHCI 3.0 ten-bit divided clock: f = base / (2 * n), n == 0 meaning base. */
++static void
++emmc_set_clock(uint32_t want_hz)
++{
++	uint32_t caps = rd32(SDHCI_CAPABILITIES);
++	uint32_t base = ((caps >> 8) & 0xffu) * 1000000u;
++	uint32_t n = 0;
++	uint16_t v;
++
++	if (!base) {
++		base = 200000000u;
++	}
++	if (want_hz < base) {
++		for (n = 1; n < 0x3ff; n++) {
++			if (base / (2 * n) <= want_hz) {
++				break;
++			}
++		}
++	}
++	wr16(SDHCI_CLOCK_CONTROL, 0);
++	v = (uint16_t)(((n & 0xff) << 8) | (((n >> 8) & 0x3) << 6) | CLK_INTERNAL_EN);
++	wr16(SDHCI_CLOCK_CONTROL, v);
++	for (int i = 0; i < 10000; i++) {
++		if (rd16(SDHCI_CLOCK_CONTROL) & CLK_INTERNAL_STABLE) {
++			break;
++		}
++		delay(10);
++	}
++	wr16(SDHCI_CLOCK_CONTROL, v | CLK_CARD_EN);
++	delay(1000);
++}
++
++/* 0 on success, -1 on timeout, -2 on a controller error. */
++static int
++emmc_cmd(uint8_t idx, uint32_t arg, uint8_t flags, uint32_t *resp)
++{
++	uint32_t inhibit = STATE_CMD_INHIBIT;
++	uint32_t s;
++
++	if ((flags & 0x03) == CMD_RESP_48_BUSY || (flags & CMD_DATA_PRESENT)) {
++		inhibit |= STATE_DAT_INHIBIT;
++	}
++	if (wait_clear(inhibit, 1000) < 0) {
++		return -1;
++	}
++	wr32(SDHCI_INT_STATUS, INT_ALL);
++	wr32(SDHCI_ARGUMENT, arg);
++	wr16(SDHCI_COMMAND, (uint16_t)((idx << 8) | flags));
++
++	s = wait_int(INT_CMD_COMPLETE, 1000);
++	if (!s) {
++		/* The command is still latched, so CMD_INHIBIT would stay set
++		 * and every later command would fail before being issued. */
++		reset_cmd_dat();
++		return -1;
++	}
++	if (s & INT_ERROR) {
++		wr32(SDHCI_INT_STATUS, INT_ALL);
++		reset_cmd_dat();
++		return -2;
++	}
++	wr32(SDHCI_INT_STATUS, INT_CMD_COMPLETE);
++	if (resp) {
++		resp[0] = rd32(SDHCI_RESPONSE + 0);
++		if ((flags & 0x03) == CMD_RESP_136) {
++			resp[1] = rd32(SDHCI_RESPONSE + 4);
++			resp[2] = rd32(SDHCI_RESPONSE + 8);
++			resp[3] = rd32(SDHCI_RESPONSE + 12);
++		}
++	}
++	return 0;
++}
++
++/* Caller holds sweet_emmc_lock. buf must have room for 512 bytes. */
++static int
++emmc_read_block(uint64_t lba, void *buf)
++{
++	uint32_t *p = (uint32_t *)buf;
++	uint32_t s;
++
++	if (wait_clear(STATE_CMD_INHIBIT | STATE_DAT_INHIBIT, 1000) < 0) {
++		return EIO;
++	}
++	wr16(SDHCI_BLOCK_SIZE, EMMC_BLOCK);
++	wr16(SDHCI_BLOCK_COUNT, 1);
++	wr8(SDHCI_TIMEOUT_CONTROL, 0x0e);
++	wr16(SDHCI_TRANSFER_MODE, TRNS_READ);
++
++	/* CMD17 READ_SINGLE_BLOCK. Sector addressing: the argument is the LBA. */
++	if (emmc_cmd(17, (uint32_t)lba, CMD_RESP_48 | CMD_CRC_CHECK |
++	    CMD_IDX_CHECK | CMD_DATA_PRESENT, NULL) < 0) {
++		return EIO;
++	}
++	s = wait_int(INT_BUF_READ_RDY, 1000);
++	if (!s || (s & INT_ERROR)) {
++		reset_cmd_dat();
++		return EIO;
++	}
++	wr32(SDHCI_INT_STATUS, INT_BUF_READ_RDY);
++	for (int i = 0; i < (int)(EMMC_BLOCK / 4); i++) {
++		p[i] = rd32(SDHCI_BUFFER);
++	}
++	s = wait_int(INT_XFER_COMPLETE, 1000);
++	if (!s || (s & INT_ERROR)) {
++		reset_cmd_dat();
++		return EIO;
++	}
++	wr32(SDHCI_INT_STATUS, INT_ALL);
++	return 0;
++}
++
++/* Bring the card from idle to transfer state. Caller holds the lock. */
++static int
++emmc_identify(void)
++{
++	uint32_t resp[4] = { 0, 0, 0, 0 };
++	uint32_t ocr = 0;
++	int rc, i;
++
++	wr32(SDHCI_INT_ENABLE, INT_ALL);
++	wr32(SDHCI_SIGNAL_ENABLE, 0);
++	wr32(CORE_PWRCTL_MASK, PWRCTL_REQ_MASK);
++
++	reset_cmd_dat();
++	(void)emmc_power_on();
++	delay(10000);                   /* rails settle; spec wants 74 clocks */
++	emmc_set_clock(400000);
++
++	/* If the card is somehow already selected, CMD13 answers and we are done. */
++	if (emmc_cmd(13, MMC_RCA << 16, CMD_RESP_48 | CMD_CRC_CHECK |
++	    CMD_IDX_CHECK, resp) == 0) {
++		return 0;
++	}
++
++	if (emmc_cmd(0, 0, CMD_RESP_NONE, NULL) < 0) {
++		printf("SWEET EMMC: CMD0 failed\n");
++		return ENXIO;
++	}
++	/* CMD1 SEND_OP_COND, sector mode, until the card leaves busy. */
++	for (i = 0; i < 1000; i++) {
++		if (emmc_cmd(1, 0x40ff8080, CMD_RESP_48, resp) != 0) {
++			break;
++		}
++		ocr = resp[0];
++		if (ocr & 0x80000000u) {
++			break;
++		}
++		delay(1000);
++	}
++	if (!(ocr & 0x80000000u)) {
++		printf("SWEET EMMC: card never left busy (ocr 0x%x)\n", ocr);
++		return ENXIO;
++	}
++	if (emmc_cmd(2, 0, CMD_RESP_136 | CMD_CRC_CHECK, resp) < 0 ||
++	    emmc_cmd(3, MMC_RCA << 16, CMD_RESP_48 | CMD_CRC_CHECK |
++	    CMD_IDX_CHECK, resp) < 0 ||
++	    emmc_cmd(9, MMC_RCA << 16, CMD_RESP_136 | CMD_CRC_CHECK, resp) < 0 ||
++	    emmc_cmd(7, MMC_RCA << 16, CMD_RESP_48_BUSY | CMD_CRC_CHECK |
++	    CMD_IDX_CHECK, resp) < 0 ||
++	    emmc_cmd(16, EMMC_BLOCK, CMD_RESP_48 | CMD_CRC_CHECK |
++	    CMD_IDX_CHECK, resp) < 0) {
++		printf("SWEET EMMC: identification failed\n");
++		return ENXIO;
++	}
++	return 0;
++}
++
++/*
++ * Find a GPT partition by name. The table is at LBA 1; entry names are
++ * UTF-16LE, which is compared against the wanted ASCII name directly
++ * because every partition name on this device is ASCII.
++ */
++static int
++emmc_find_partition(const char *want)
++{
++	static uint8_t blk[EMMC_BLOCK] __attribute__((aligned(8)));
++	uint64_t ent_lba, first, last;
++	uint32_t nent, entsz, i, per_blk, j;
++	int error;
++
++	error = emmc_read_block(1, blk);
++	if (error) {
++		return error;
++	}
++	if (memcmp(blk, "EFI PART", 8) != 0) {
++		printf("SWEET EMMC: no GPT header at LBA 1\n");
++		return ENXIO;
++	}
++	memcpy(&ent_lba, blk + 72, sizeof(ent_lba));
++	memcpy(&nent, blk + 80, sizeof(nent));
++	memcpy(&entsz, blk + 84, sizeof(entsz));
++	if (entsz < 128 || entsz > EMMC_BLOCK || nent == 0 || nent > 1024) {
++		printf("SWEET EMMC: implausible GPT (%u entries of %u)\n", nent, entsz);
++		return ENXIO;
++	}
++	per_blk = EMMC_BLOCK / entsz;
++
++	for (i = 0; i < nent; i += per_blk) {
++		error = emmc_read_block(ent_lba + i / per_blk, blk);
++		if (error) {
++			return error;
++		}
++		for (j = 0; j < per_blk && i + j < nent; j++) {
++			const uint8_t *e = blk + j * entsz;
++			char name[GPT_ENTRY_NAME_LEN + 1];
++			int k;
++
++			/* An all-zero type GUID means an unused entry. */
++			for (k = 0; k < 16; k++) {
++				if (e[k]) {
++					break;
++				}
++			}
++			if (k == 16) {
++				continue;
++			}
++			for (k = 0; k < GPT_ENTRY_NAME_LEN; k++) {
++				name[k] = (char)e[56 + 2 * k];
++			}
++			name[GPT_ENTRY_NAME_LEN] = '\0';
++			if (strncmp(name, want, GPT_ENTRY_NAME_LEN) != 0) {
++				continue;
++			}
++			memcpy(&first, e + 32, sizeof(first));
++			memcpy(&last, e + 40, sizeof(last));
++			if (last < first) {
++				return ENXIO;
++			}
++			se.first_block = first;
++			se.nblocks = last - first + 1;
++			return 0;
++		}
++	}
++	printf("SWEET EMMC: no partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++static int
++sweet_emmc_open(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return se.ready ? 0 : ENXIO;
++}
++
++static int
++sweet_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sweet_emmc_psize(__unused dev_t dev)
++{
++	return se.ready ? (int)MIN(se.nblocks, INT_MAX) : -1;
++}
++
++static void
++sweet_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * se.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = se.nblocks * EMMC_BLOCK;
++	static uint8_t bounce[EMMC_BLOCK] __attribute__((aligned(8)));
++
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	for (uint32_t did = 0; did < count;) {
++		uint64_t pos = off + did;
++		uint64_t lba = pos / EMMC_BLOCK;
++		uint32_t skip = (uint32_t)(pos % EMMC_BLOCK);
++		uint32_t want = MIN(count - did, EMMC_BLOCK - skip);
++
++		if (skip == 0 && want == EMMC_BLOCK) {
++			/* Whole block: read straight into the caller's buffer. */
++			error = emmc_read_block(se.first_block + lba, vaddr + did);
++		} else {
++			error = emmc_read_block(se.first_block + lba, bounce);
++			if (!error) {
++				memcpy(vaddr + did, bounce + skip, want);
++			}
++		}
++		if (error) {
++			break;
++		}
++		did += want;
++		buf_setresid(bp, count - did);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_emmc_bioctl(__unused dev_t dev, u_long cmd, caddr_t data,
++    __unused int flag, __unused struct proc *p)
++{
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*(uint32_t *)data = se.secsize;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*(uint64_t *)data = se.nblocks;
++		return 0;
++	case DKIOCISWRITABLE:
++		*(uint32_t *)data = 0;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag,
++    struct proc *p)
++{
++	return sweet_emmc_bioctl(dev, cmd, data, flag, p);
++}
++
++static int
++sweet_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_emmc_strategy, NULL, dev, B_READ, minphys, uio,
++	           (int)se.secsize);
++}
++
++static int
++sweet_emmc_write(__unused dev_t dev, __unused struct uio *uio,
++    __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw sweet_emmc_bdevsw = {
++	.d_open     = sweet_emmc_open,
++	.d_close    = sweet_emmc_close,
++	.d_strategy = sweet_emmc_strategy,
++	.d_ioctl    = sweet_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_emmc_cdevsw = {
++	.d_open       = sweet_emmc_open,
++	.d_close      = sweet_emmc_close,
++	.d_read       = sweet_emmc_read,
++	.d_write      = sweet_emmc_write,
++	.d_ioctl      = sweet_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++int sweet_emmc_init(void);
++
++int
++sweet_emmc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET EMMC: no /sweet-emmc node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++
++	se.regs = ml_io_map(reg[0], reg[1]);
++	se.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	error = emmc_identify();
++	if (!error) {
++		error = emmc_find_partition(want);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	se.bmajor = bdevsw_add(-1, &sweet_emmc_bdevsw);
++	if (se.bmajor < 0) {
++		return ENXIO;
++	}
++	se.cmajor = cdevsw_add_with_bdev(-1, &sweet_emmc_cdevsw, se.bmajor);
++	if (se.cmajor < 0) {
++		return ENXIO;
++	}
++	se.bdev = makedev(se.bmajor, 0);
++	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++	se.ready = true;
++	printf("SWEET EMMC: \"%s\": first LBA 0x%llx, %llu MiB, read-only\n",
++	    want, se.first_block, se.nblocks * EMMC_BLOCK >> 20);
++	return 0;
++}
++
++/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
++int sweet_emmc_rootdev(dev_t *dev);
++
++int
++sweet_emmc_rootdev(dev_t *dev)
++{
++	if (!se.ready) {
++		int error = sweet_emmc_init();
++
++		if (error) {
++			return error;
++		}
++	}
++	*dev = se.bdev;
++	return 0;
++}

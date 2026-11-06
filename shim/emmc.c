@@ -358,6 +358,7 @@ static int cmd(uint8_t idx, uint32_t arg, uint8_t flags, uint32_t *resp)
 		return -2;
 	}
 	wr32(SDHCI_INT_STATUS, INT_CMD_COMPLETE);
+	last_err = 0;		/* so a stale failure is not reported beside a success */
 	if (resp) {
 		resp[0] = rd32(SDHCI_RESPONSE + 0);
 		if ((flags & 0x03) == CMD_RESP_136) {

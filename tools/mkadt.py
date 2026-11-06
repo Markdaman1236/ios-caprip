@@ -53,6 +53,11 @@ FB_STRIDE = FB_W * 4
 NO_UFS = DEVICE in ('caprip', 'gta4l')
 # Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x04804000, 0x3000
+# Internal eMMC host, sdhci@4744000 "qcom,sdhci-msm-v5" + "-cqe". hc_mem only:
+# the cqhci block (0x4745000) and the inline crypto engine (0x4748000) are not
+# used -- the driver is PIO and read-only. This is the storage bengal actually
+# boots from; its UFS block is unclocked.
+EMMC, EMMC_SIZE = 0x04744000, 0x1000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
@@ -225,6 +230,15 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('stride', u32(FB_STRIDE)),
     ])
 
+    # bsd/dev/sweet_emmc.c: the SDHCI host. Unlike UFS this is NOT left running
+    # -- ABL hands off with bus power off -- so the driver powers and
+    # identifies the card itself. Root on it with rd=emmcroot0.
+    emmc = node('sweet-emmc', [
+        ph(),
+        ('compatible', cstr('qcom,sdhci-msm-v5')),
+        ('reg', u64(EMMC, EMMC_SIZE)),
+    ])
+
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
         ph(),
@@ -268,7 +282,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or NO_UFS) else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or NO_UFS) else [ufs])
+                 + ([emmc] if (NO_UFS and not qemu) else []))
 
 
 if __name__ == '__main__':
