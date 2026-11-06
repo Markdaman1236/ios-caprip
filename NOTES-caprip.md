@@ -198,6 +198,70 @@ None of them block reaching userspace, so they are follow-up work rather
 than a prerequisite. Anyone rebuilding should re-read the apply log before
 trusting a patch is in: `gh run view <id> --log | grep -i 'skipping patch'`.
 
+## Userspace reached (2026-11-06)
+
+```
+*** SWEET userspace: init running as PID 1 ***
+SWEET init: still alive
+SWEET init: still alive          <- every 5 s, on caprip's panel
+```
+
+Darwin userspace runs on the Moto G30. The repeating line is the whole
+proof: it is `tools/sweet-init.S` calling `select(NULL, 5s)` in a loop and
+writing to `/dev/console`, so exec, the user/kernel boundary, devfs, the
+syscall path (`write`, `getpid`, `select`) and the scheduler all work, and
+PID 1 is alive rather than exiting (which would panic the kernel).
+
+No filesystem is involved. xnu's **mockfs** serves a bare Mach-O memory
+disk as `/sbin/launchd`, so the "root" is simply the 16,635-byte static
+ad-hoc-signed binary from `tools/mkinit.py`, handed to `mkpayload.py
+--ramdisk` and booted with `rd=md0`. `mkpayload` appends it as a segment
+and adds `/chosen/memory-map RAMDisk = <0xc2120000, 0x8000>` for
+`IOFindBSDRoot`. The HFS+ work is for the *real* root, not for this.
+
+### Getting there without a Mac
+
+The proper fix is the split patch `0080` committed here, but it could not
+be built: **no macOS runner can be acquired for this account.** Every
+attempt, on every surviving label:
+
+| label | annotation |
+|---|---|
+| `macos-14` | `The configuration 'macos-14-arm64-us-default' is not supported` |
+| `macos-15` | `The job was not acquired by Runner of type hosted even after multiple attempts` |
+| `macos-15-intel` | same |
+| `macos-latest` | same, plus a macOS-arm64 capacity notice |
+
+So patch 0080's semantics were applied straight to the built kernel
+instead, by `tools/caprip/binpatch-cpu-topology.sh`. The kernel has no
+`LC_CODE_SIGNATURE` and no chained fixups, so editing code bytes is safe.
+Three instructions, all in place and same-length:
+
+```
+fffffe0007aba288  711c011f -> 7108011f   cmp w8, #0x700  ->  cmp w8, #0x200
+fffffe0007aba28c  54000c88 -> 54000c82   b.hi            ->  b.cs
+fffffe0007aba290  12001d08 -> 121e1508   and w8,w8,#0xff ->  and w8,w8,#0xfc
+```
+
+The first pair gives `(phys_id >> 8) > 1`; the third gives
+`(phys_id & 0xff) > 3`, because 0..3 have no bits above bit 1, so masking
+with `0xfc` *is* "greater than 3" for a byte. Together that is exactly
+patch 0080's guard. Checked against caprip's real MPIDRs: `0x100..0x103`
+all pass, `0x104` would still be rejected. The script verifies the current
+word at each address before writing and refuses on any mismatch.
+
+This is a stopgap. `0080` is committed and will apply whenever a macOS
+runner can be had; the binary patch then becomes unnecessary.
+
+### Rebuilding this exact image
+
+```sh
+tools/caprip/make-init.sh                      # -> build/init/launchd
+tools/caprip/binpatch-cpu-topology.sh          # -> kernel.development.caprip
+tools/build_caprip.sh kernel.development.caprip build/init/launchd
+fastboot boot out/xnu-caprip.img
+```
+
 ## Known gaps
 
 - `/product` node absent: upstream's `research/ipsw-x/d22ap.adt` is not in the
