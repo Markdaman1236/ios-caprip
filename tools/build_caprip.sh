@@ -52,27 +52,30 @@ cat "$OUT/shim.bin" "$OUT/payload.bin" > "$OUT/Image"
 gzip -9 -f -k "$OUT/Image"
 
 # --- 4. pack ---------------------------------------------------------------
+# MEASURED on caprip: ABL *rejects* a header v2 image -- it returns to
+# fastboot after ~2 s without ever running the kernel. Header v3 (caprip's
+# native layout) works: ABL pairs our RAM-booted boot.img with the
+# vendor_boot already on flash, which supplies a valid caprip DTB for free.
+# That is also why `fastboot boot` takes no vendor_boot argument.
+#
 # caprip's stock kernel is itself gzipped, so ABL's gunzip path is proven.
-# The raw image is packed too, as a fallback if that path misbehaves.
-for variant in gz raw; do
-    case $variant in
-        gz)  img="$OUT/Image.gz"; out="$OUT/xnu-caprip.img" ;;
-        raw) img="$OUT/Image";    out="$OUT/xnu-caprip-raw.img" ;;
-    esac
-    python3 tools/mkboot_caprip.py \
-        --kernel "$img" \
-        --dtb tools/caprip/sm6115-motorola-caprip.dtb \
-        --ramdisk "$OUT/ramdisk.bin" \
-        --cmdline "$CMD" \
-        --header-version 2 \
-        -o "$out"
-done
+python3 tools/mkboot_caprip.py --kernel "$OUT/Image.gz" --cmdline "$CMD" \
+    --header-version 3 -o "$OUT/xnu-caprip.img"
+python3 tools/mkboot_caprip.py --kernel "$OUT/Image.gz" --cmdline "$CMD" \
+    --header-version 4 -o "$OUT/xnu-caprip-v4.img"
+python3 tools/mkboot_caprip.py --kernel "$OUT/Image" --cmdline "$CMD" \
+    --header-version 3 -o "$OUT/xnu-caprip-raw.img"
+python3 tools/mkboot_caprip.py --kernel "$OUT/Image.gz" --cmdline "$CMD" \
+    --dtb tools/caprip/sm6115-motorola-caprip.dtb \
+    --header-version 2 -o "$OUT/xnu-caprip-v2.img"
 
 ls -l "$OUT"/xnu-caprip*.img
-cat <<'EOT'
-
-Boot it from RAM (writes nothing):
-    fastboot boot out/xnu-caprip.img
-Fallback if ABL refuses the gzipped kernel:
-    fastboot boot out/xnu-caprip-raw.img
-EOT
+echo
+echo "Boot it from RAM (writes nothing):"
+echo "    fastboot boot out/xnu-caprip.img        # header v3 -- the one that works"
+echo "Alternatives:"
+echo "    fastboot boot out/xnu-caprip-v4.img     # v3 + signature_size field"
+echo "    fastboot boot out/xnu-caprip-raw.img    # uncompressed kernel"
+echo "    fastboot boot out/xnu-caprip-v2.img     # self-contained; ABL rejects it"
+echo
+echo "Recover at any time by holding Power for ~10 s: nothing was flashed."

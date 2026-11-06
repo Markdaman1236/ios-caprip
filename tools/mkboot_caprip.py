@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """Pack a caprip (Motorola moto g30, SM6115 bengal) XNU boot image - stdlib only.
 
-Geometry is caprip's own, read out of the live vendor_boot_a header:
-  kernel @0x00008000, ramdisk @0x01000000, tags @0x00000100, dtb @0x01f00000,
-  page 4096.
+caprip ships boot header v3. In that layout boot.img carries neither the DTB
+nor the load addresses: ABL takes both from vendor_boot. That is also why
+`fastboot boot` has no vendor_boot argument -- ABL pairs the RAM-booted
+boot.img with the vendor_boot already on flash in the active slot, which
+hands us a valid caprip DTB for free.
 
-caprip ships boot header v3, where boot.img carries no DTB and no load
-addresses -- ABL takes both from vendor_boot. Two ways to satisfy it:
+  --header-version 3  (default)  caprip's native layout. DTB and load
+        addresses come from the on-flash vendor_boot. This is the one that
+        matches how the device actually boots.
+  --header-version 4             v3 plus the signature_size field.
+  --header-version 2             Self-contained: load addresses and DTB live
+        in the image. Proven on gta4l (same SoC), but caprip's ABL rejects
+        it -- it returns to fastboot after ~2 s without running the kernel.
 
-  --header-version 2  (default)
-      Self-contained: addresses and DTB live in the image, nothing else
-      needed. `fastboot boot out/xnu-caprip.img`. Qualcomm ABL keeps a v0-v2
-      parser, and this is the variant proven on gta4l (same SoC).
+The geometry below was read out of caprip's live vendor_boot_a header and is
+only used by the v2 layout.
 
-  --header-version 3
-      Matches the stock layout, but ABL then needs the DTB from vendor_boot:
-      `fastboot boot out/xnu-caprip.img out/vendor_boot-caprip.img`.
-
-Both are RAM-only through `fastboot boot`; neither writes to the device.
+Everything here is for `fastboot boot`, which runs from RAM and writes
+nothing to the device.
 """
 import argparse
+import gzip
+import io
 import struct
 import sys
 
@@ -30,7 +34,11 @@ TAGS_ADDR = 0x00000100
 DTB_ADDR = 0x01F00000
 HDR_V2_SIZE = 1660
 HDR_V3_SIZE = 1580
+HDR_V4_SIZE = 1584
 FDT_MAGIC = b"\xd0\x0d\xfe\xed"
+# caprip's stock boot_a os_version word: Android 11.0.0, patch level 2024-02.
+# Reused verbatim in case ABL or AVB sanity-checks the patch level.
+OS_VERSION = 0x16000982
 
 
 def pad(data, page=PAGE):
@@ -43,11 +51,31 @@ def check_dtb(path):
         sys.exit("%s: not a flattened device tree" % path)
     total = struct.unpack_from(">I", dtb, 4)[0]
     if total != len(dtb):
-        sys.exit("%s: totalsize %d != file size %d (truncated?)" % (path, total, len(dtb)))
+        sys.exit("%s: totalsize %d != file size %d (truncated?)"
+                 % (path, total, len(dtb)))
     for prop in (b"qcom,msm-id", b"qcom,board-id"):
         if prop not in dtb:
             sys.exit("%s: missing %s; ABL will reject it" % (path, prop.decode()))
     return dtb
+
+
+def empty_ramdisk():
+    """A valid gzipped newc cpio holding only the TRAILER record.
+
+    ABL dislikes a zero-length ramdisk on some builds, and for us the ramdisk
+    is dead weight anyway: the xnu payload rides inside the kernel Image
+    (loader.c's EMBED path), not in the ramdisk.
+    """
+    name = b"TRAILER!!!\0"
+    fields = [0] * 13
+    fields[4] = 1                                     # nlink
+    fields[11] = len(name)                            # namesize
+    rec = b"070701" + b"".join(b"%08X" % f for f in fields) + name
+    rec += b"\0" * (-len(rec) % 4)
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
+        g.write(rec)
+    return buf.getvalue()
 
 
 def build_v2(kernel, ramdisk, dtb, cmdline, name):
@@ -60,7 +88,7 @@ def build_v2(kernel, ramdisk, dtb, cmdline, name):
         0, 0,                       # second stage
         TAGS_ADDR, PAGE,
         2,                          # header_version
-        0,                          # os_version
+        OS_VERSION,
     )
     hdr[48:64] = name[:16].ljust(16, b"\0")
     hdr[64:576] = cmdline[:511].ljust(512, b"\0")
@@ -72,12 +100,16 @@ def build_v2(kernel, ramdisk, dtb, cmdline, name):
     return pad(bytes(hdr)) + pad(kernel) + pad(ramdisk) + pad(dtb)
 
 
-def build_v3(kernel, ramdisk, cmdline):
-    hdr = bytearray(HDR_V3_SIZE)
+def build_v3v4(kernel, ramdisk, cmdline, version):
+    size = HDR_V3_SIZE if version == 3 else HDR_V4_SIZE
+    hdr = bytearray(size)
     hdr[0:8] = b"ANDROID!"
-    struct.pack_into("<4I", hdr, 8, len(kernel), len(ramdisk), 0, HDR_V3_SIZE)
-    struct.pack_into("<I", hdr, 40, 3)               # header_version
+    struct.pack_into("<4I", hdr, 8, len(kernel), len(ramdisk), OS_VERSION, size)
+    # reserved[4] at 24..39 stays zero
+    struct.pack_into("<I", hdr, 40, version)         # header_version
     hdr[44:44 + 1536] = cmdline[:1535].ljust(1536, b"\0")
+    if version == 4:
+        struct.pack_into("<I", hdr, 1580, 0)         # signature_size (unsigned)
     return pad(bytes(hdr)) + pad(kernel) + pad(ramdisk)
 
 
@@ -85,15 +117,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--dtb", help="board DTB (header v2 only)")
-    ap.add_argument("--ramdisk")
+    ap.add_argument("--ramdisk", help="default: a generated empty cpio.gz")
     ap.add_argument("--cmdline", default="")
     ap.add_argument("--name", default="caprip-xnu")
-    ap.add_argument("--header-version", type=int, default=2, choices=(2, 3))
+    ap.add_argument("--header-version", type=int, default=3, choices=(2, 3, 4))
     ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
 
     kernel = open(a.kernel, "rb").read()
-    ramdisk = open(a.ramdisk, "rb").read() if a.ramdisk else b""
+    ramdisk = open(a.ramdisk, "rb").read() if a.ramdisk else empty_ramdisk()
     cmdline = a.cmdline.encode()
 
     if a.header_version == 2:
@@ -104,14 +136,14 @@ def main():
         extra = "dtb %d @%#x" % (len(dtb), DTB_ADDR)
     else:
         if a.dtb:
-            sys.exit("header v3 carries no DTB; it comes from vendor_boot")
-        img = build_v3(kernel, ramdisk, cmdline)
-        extra = "dtb from vendor_boot"
+            sys.exit("header v%d carries no DTB; it comes from vendor_boot"
+                     % a.header_version)
+        img = build_v3v4(kernel, ramdisk, cmdline, a.header_version)
+        extra = "dtb from the on-flash vendor_boot of the active slot"
 
     open(a.out, "wb").write(img)
-    print("PACKED %s (%d B) v%d: kernel %d @%#x, ramdisk %d @%#x, %s"
-          % (a.out, len(img), a.header_version, len(kernel), KERNEL_ADDR,
-             len(ramdisk), RAMDISK_ADDR, extra))
+    print("PACKED %s (%d B) v%d: kernel %d, ramdisk %d, %s"
+          % (a.out, len(img), a.header_version, len(kernel), len(ramdisk), extra))
 
 
 if __name__ == "__main__":

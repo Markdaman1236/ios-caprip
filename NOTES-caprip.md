@@ -114,6 +114,41 @@ returns the device to Android.
     kernel          no LC_DYLD_CHAINED_FIXUPS -- "fixups: 0" is correct here,
                     not a silent failure (plain arm64, not arm64e)
 
+## Result of the first boot attempt (2026-11-06)
+
+**xnu boots on caprip.** `fastboot boot out/xnu-caprip.img` (header v3) runs the
+shim, the loader succeeds, and xnu comes up far enough to render its own panic
+screen on the panel -- the one that says to report the panic at
+`panic.apple.com`. That it renders at all means `boot_args.Video` /
+`AppleCLCD` have the right 720x1600 geometry. The panic itself is expected:
+there is no root filesystem yet.
+
+### Boot-image format: measured, not guessed
+
+caprip's ABL **rejects header v2**, the format proven on gta4l. The signature is
+unmistakable once you measure it:
+
+| image | `fastboot boot` says | device away from fastboot | verdict |
+|---|---|---|---|
+| header v2 (with embedded DTB) | `Booting OKAY [10.76s]` | **2 s**, then back in fastboot | never ran |
+| header v3 (DTB from flash) | `Booting OKAY [10.76s]` | **indefinitely**, USB gone entirely | ran |
+
+`Booting OKAY` is not evidence of anything: ABL prints it either way. The useful
+signal is how long the device stays away from fastboot, because the shim can
+never return there quickly:
+
+- `gold_main()` ends in `for (;;) wfe` on a loader failure -- it hangs, it does
+  not reset.
+- the Silver fallback path waits `delay_ms(180000)` + `reset(20)` = 3 min 20 s
+  before rebooting to the bootloader.
+
+So a return to fastboot within seconds proves ABL never transferred control,
+and `tools/../build/boot-timing.sh` is the probe that distinguishes the cases.
+
+Header v3 is caprip's native layout, and it needs no DTB in the image: ABL pairs
+the RAM-booted `boot.img` with the `vendor_boot` already on flash in the active
+slot. That is also why `fastboot boot` takes no vendor_boot argument.
+
 ## Known gaps
 
 - `/product` node absent: upstream's `research/ipsw-x/d22ap.adt` is not in the
