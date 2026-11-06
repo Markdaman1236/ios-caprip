@@ -149,6 +149,55 @@ Header v3 is caprip's native layout, and it needs no DTB in the image: ABL pairs
 the RAM-booted `boot.img` with the `vendor_boot` already on flash in the active
 slot. That is also why `fastboot boot` takes no vendor_boot argument.
 
+## The first panic, and what it exposed
+
+```
+panic(cpu 0 caller 0xfffffe0007aba44c): SWEET CPU: invalid topology
+cpu=1 mpidr=0x101 count=4 @SweetCPU.cpp:80
+```
+
+Before it, the log shows xnu getting a long way: device-tree platform
+expert, AppleKeyStore, IOWatchdog, IOCoreSurfaceRoot, HID buttons, HID
+touch -- all registered, all rendered on caprip's panel. `iBoot version:
+topaz-shim`.
+
+The guard that fired comes from patch `0078`, which allows only
+`(phys_id & 0xff) == 0` -- fine for sweet's MPIDRs (0x000..0x700, Aff1 =
+core), wrong for bengal, where Aff1 is the *cluster* and Aff0 the core, so
+the Gold cluster is 0x100..0x103. Patch `0080` fixes exactly that.
+
+**`0080` never applied.** The build log for the artifact in use
+(`NoNameBuilder/ios-topaz` run 39498191206) shows **52 of 118 patches
+skipped**, because `git apply` is all-or-nothing per patch file and one
+stale hunk discards the rest:
+
+```
+Skipping patch .../0080-topaz-cpu-topology-skip-sweet-hw.patch
+error: patch failed: bsd/dev/sweet_ufs.c:656
+```
+
+The `SweetCPU.cpp` hunk in that same patch matches the tree exactly -- it
+was simply collateral. Independent confirmation: the shipped binary still
+contains the string `Kryo 470`, which `0080` renames to `Kryo 260`.
+
+Fix: split the patch so the hunk that matters stands alone.
+
+| patch | touches | expected |
+|---|---|---|
+| `0080` | `SweetCPU.cpp` | **must apply** -- the topology guard |
+| `0080b` | `sweet_ufs.c` | still skipped; only gates keys/touch/USB behind `sweethw=1` |
+| `0080c` | `SWEET.h` | a comment |
+
+### The other 51
+
+Also skipped: `0061` (the iPhone-X display-size patch -- so the panel is
+*not* in fact being presented as 1125x2436 in this build; the framebuffer
+works because `boot_args.Video` drives `AppleCLCD` directly), all touch,
+all USB, display power, backlight, and the whole `SweetSurface` series.
+None of them block reaching userspace, so they are follow-up work rather
+than a prerequisite. Anyone rebuilding should re-read the apply log before
+trusting a patch is in: `gh run view <id> --log | grep -i 'skipping patch'`.
+
 ## Known gaps
 
 - `/product` node absent: upstream's `research/ipsw-x/d22ap.adt` is not in the
