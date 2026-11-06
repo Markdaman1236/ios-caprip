@@ -1,0 +1,44 @@
+Add IORPC.kernelContent for Xcode 16's iig.
+
+xnu-8796 (macOS 13.5) predates this field. Xcode 15.x's iig did not emit
+references to it, which is why the build pinned runs-on: macos-14 -- the
+last GitHub-hosted image carrying Xcode 15.x. That image is retired
+("The configuration 'macos-14-arm64-us-default' is not supported"), and
+macos-15 ships Xcode 16.0 through 26.3 with no 15.x at all, so the pin
+cannot be restored. Installing Xcode 15.4 via xcodes needs Apple
+Developer credentials.
+
+Current xnu adds the member kernel-only; this is that change, applied to
+both copies of the header exactly as upstream has it:
+
+    https://github.com/apple-oss-distributions/xnu/blob/main/iokit/DriverKit/IORPC.h
+
+The field is declared but never populated here. Nothing in this port runs
+a DriverKit user server, so the RPC path that would read it is not
+exercised; if a dext is ever loaded, IOUserServer would need the matching
+change too.
+
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,9 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,9 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
