@@ -46,7 +46,7 @@ diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,736 @@
 +/*
 + * SWEET internal eMMC root device (read-only).
 + *
@@ -97,6 +97,9 @@ new file mode 100644
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +/* Standard SDHCI registers (SD Host Controller Simplified Spec 3.00). */
 +#define SDHCI_BLOCK_SIZE        0x04    /* 16 */
@@ -440,7 +443,7 @@ new file mode 100644
 +{
 +	uint32_t resp[4] = { 0, 0, 0, 0 };
 +	uint32_t ocr = 0;
-+	int rc, i;
++	int i;
 +
 +	wr32(SDHCI_INT_ENABLE, INT_ALL);
 +	wr32(SDHCI_SIGNAL_ENABLE, 0);
@@ -643,15 +646,24 @@ new file mode 100644
 +sweet_emmc_bioctl(__unused dev_t dev, u_long cmd, caddr_t data,
 +    __unused int flag, __unused struct proc *p)
 +{
++	/* memcpy rather than a cast: caddr_t is char *, so casting it to a
++	 * wider type raises -Wcast-align on an alignment the caller does
++	 * guarantee but the type does not express. */
++	uint32_t u32;
++	uint64_t u64;
++
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
-+		*(uint32_t *)data = se.secsize;
++		u32 = se.secsize;
++		memcpy(data, &u32, sizeof(u32));
 +		return 0;
 +	case DKIOCGETBLOCKCOUNT:
-+		*(uint64_t *)data = se.nblocks;
++		u64 = se.nblocks;
++		memcpy(data, &u64, sizeof(u64));
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*(uint32_t *)data = 0;
++		u32 = 0;
++		memcpy(data, &u32, sizeof(u32));
 +		return 0;
 +	default:
 +		return ENOTTY;
