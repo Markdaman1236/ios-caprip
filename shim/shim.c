@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "emmc.h"
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -505,6 +506,22 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+#ifdef EMMC_PROBE
+	/*
+	 * Dedicated eMMC bring-up image: probe the host, report on the panel,
+	 * then reset. Never loads xnu. Runs on the boot (Silver) CPU, which is
+	 * fine -- MMIO does not care which cluster issues it, and keeping the
+	 * probe before the Gold handoff removes a variable.
+	 */
+	stage = "emmc";
+	emmc_probe();
+	con_skip();
+	/* Hold the result on screen long enough to read and photograph it:
+	 * the panel is the only output channel this board has. */
+	con_str("HOLD", "5 min, then reset to bootloader");
+	delay_ms(300000);
+	reset(40);
+#endif
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
