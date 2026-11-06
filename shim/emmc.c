@@ -418,6 +418,76 @@ uint32_t emmc_read_blocks(uint32_t lba, void *buf, uint32_t n)
 	return done;
 }
 
+/*
+ * Walk the GPT, find a partition by name, and report what is at its start.
+ * This is the same lookup the kernel driver does (bsd/dev/sweet_emmc.c), so
+ * exercising it here validates that code path on real hardware, and it is
+ * how the written iOS root gets verified: an HFS+ volume header lives 1024
+ * bytes into the volume, so at partition LBA 2. mkfs.hfsplus -s makes a
+ * case-sensitive volume, whose signature is "HX" rather than "H+".
+ */
+static int emmc_check_partition(const char *want)
+{
+	static uint8_t blk[512] __attribute__((aligned(8)));
+	uint64_t ent_lba, first = 0, last = 0;
+	uint32_t nent, entsz, per_blk, i, j;
+
+	if (emmc_read_block(1, blk) != 0)
+		return -1;
+	ent_lba = 0;
+	for (i = 0; i < 8; i++)
+		ent_lba |= (uint64_t)blk[72 + i] << (8 * i);
+	nent = (uint32_t)(blk[80] | (blk[81] << 8) | (blk[82] << 16) | (blk[83] << 24));
+	entsz = (uint32_t)(blk[84] | (blk[85] << 8) | (blk[86] << 16) | (blk[87] << 24));
+	con_hex2("GPTHDR", "ents=", nent, "entsz=", entsz);
+	if (entsz < 128 || entsz > 512 || !nent || nent > 1024)
+		return -1;
+	per_blk = 512 / entsz;
+
+	for (i = 0; i < nent; i += per_blk) {
+		if (emmc_read_block(ent_lba + i / per_blk, blk) != 0)
+			return -1;
+		for (j = 0; j < per_blk && i + j < nent; j++) {
+			const uint8_t *e = blk + j * entsz;
+			int k, match = 1, empty = 1;
+
+			for (k = 0; k < 16; k++)
+				if (e[k]) { empty = 0; break; }
+			if (empty)
+				continue;
+			/* Entry names are UTF-16LE; every name here is ASCII. */
+			for (k = 0; want[k]; k++)
+				if (e[56 + 2 * k] != (uint8_t)want[k] ||
+				    e[56 + 2 * k + 1] != 0) { match = 0; break; }
+			if (!match || e[56 + 2 * k] != 0)
+				continue;
+			for (k = 0; k < 8; k++) {
+				first |= (uint64_t)e[32 + k] << (8 * k);
+				last  |= (uint64_t)e[40 + k] << (8 * k);
+			}
+			con_hex2("PART", "lo=", (uint32_t)first, "hi=",
+				 (uint32_t)(first >> 32));
+			con_hex("SIZE MiB", (last - first + 1) >> 11);
+			/* HFS+ volume header: 1024 bytes in, i.e. partition LBA 2. */
+			if (emmc_read_block(first + 2, blk) != 0)
+				return -1;
+			con_hex2("VOLHDR", "sig=",
+				 (uint32_t)((blk[0] << 8) | blk[1]), "ver=",
+				 (uint32_t)((blk[2] << 8) | blk[3]));
+			if (blk[0] == 'H' && (blk[1] == 'X' || blk[1] == '+')) {
+				con_str("ROOT", blk[1] == 'X' ?
+					"HFSX volume present" :
+					"HFS+ volume present");
+				return 0;
+			}
+			con_str("ROOT", "no HFS+ volume here yet");
+			return 1;
+		}
+	}
+	con_str("PART", "name not found in GPT");
+	return -1;
+}
+
 int emmc_probe(void)
 {
 	static uint8_t block[512] __attribute__((aligned(8)));
@@ -554,7 +624,12 @@ int emmc_probe(void)
 			 ((uint32_t *)block)[1]);
 		con_str("GPT", ok ? "EFI PART -- eMMC READS OK" :
 				    "no GPT signature");
-		return ok ? 0 : -2;
+		if (!ok)
+			return -2;
+		con_skip();
+		/* Does the iOS root image exist on userdata yet? */
+		emmc_check_partition("userdata");
+		return 0;
 	}
 	return rc;
 }
