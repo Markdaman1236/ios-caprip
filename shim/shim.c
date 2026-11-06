@@ -532,12 +532,23 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
+	/*
+	 * No payload. On most targets, probe the internal UFS with the MMU
+	 * still off. NOT on bengal (caprip/gta4l): the UFS block at
+	 * 0x04800000 is unclocked there, so any MMIO read bus-faults and
+	 * reboots the device -- which would destroy the loader error above,
+	 * the one thing worth reading at this point. -DNO_UFS_PROBE keeps
+	 * the message on screen instead.
+	 */
 	stage = "ufs";
+#ifdef NO_UFS_PROBE
+	con_str("UFS", "probe skipped (unclocked on bengal)");
+#else
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
+#endif
 	delay_ms(180000);
 	reset(20);
 

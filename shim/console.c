@@ -5,7 +5,9 @@
 #include "console.h"
 #include "font.h"
 
+#ifndef SCALE
 #define SCALE		3
+#endif
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
 #define MARGIN		24

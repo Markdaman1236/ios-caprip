@@ -1,2 +1,6 @@
 out*/
 *.img
+out/
+__pycache__/
+*.pyc
+.cmsg.tmp

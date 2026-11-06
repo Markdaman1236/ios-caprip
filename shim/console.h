@@ -1,10 +1,25 @@
 #pragma once
 #include <stdint.h>
 
+/*
+ * Panel geometry. The build passes -DFB_W/-DFB_H for the target device;
+ * these defaults are sweet/topaz (1080x2400). caprip (Moto G30) is
+ * 720x1600 -- see tools/build_caprip.sh.
+ *
+ * These are not cosmetic: loader.c copies FB_W/FB_H/FB_STRIDE straight into
+ * boot_args.Video, which is where xnu's AppleCLCD takes its geometry from.
+ * A wrong stride here renders the whole iOS surface skewed.
+ */
 #define FB_BASE		0x5c000000UL	/* reserved-memory cont_splash_region */
+#ifndef FB_W
 #define FB_W		1080
+#endif
+#ifndef FB_H
 #define FB_H		2400
+#endif
+#ifndef FB_STRIDE
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+#endif
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

@@ -32,7 +32,25 @@ GICR, GICR_SIZE = 0x0f300000, 0x100000
 # cont_splash_region left lit by ABL
 FB, FB_SIZE = 0x5c000000, 0xf00000
 SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = (1200, 2000, 1200 * 4) if __import__('os').environ.get('GTA4L') else (1080, 2400, 1080 * 4)
+# Panel geometry per device. DEVICE= selects it; the legacy GTA4L=1 still works.
+#   sweet/topaz  1080x2400   Redmi Note 10 Pro / POCO X5 Pro
+#   gta4l        1200x2000   Galaxy Tab A7 10.4
+#   caprip        720x1600   Motorola moto g(30)   [verified: wm size + DT]
+_env = __import__('os').environ
+DEVICE = _env.get('DEVICE', 'gta4l' if _env.get('GTA4L') else 'sweet').lower()
+_PANELS = {
+    'sweet':  (1080, 2400),
+    'topaz':  (1080, 2400),
+    'gta4l':  (1200, 2000),
+    'caprip': (720, 1600),
+}
+if DEVICE not in _PANELS:
+    sys.exit('mkadt: unknown DEVICE=%r (known: %s)' % (DEVICE, ', '.join(sorted(_PANELS))))
+FB_W, FB_H = _PANELS[DEVICE]
+FB_STRIDE = FB_W * 4
+# bengal (caprip, gta4l): the UFS block at 0x04804000 is unclocked, so any MMIO
+# read there bus-faults and reboots. Those targets boot from eMMC; omit the node.
+NO_UFS = DEVICE in ('caprip', 'gta4l')
 # Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x04804000, 0x3000
 TIMEBASE = 19200000
@@ -195,8 +213,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             # --native: present the real 1080x2400 panel (needed for direct MDP scanout,
             # which must match the canvas: sweetfb_native=1 with a 1125x2436 canvas makes
             # backboardd ask for a hardware scaler that does not exist)
-            ('canvas-width', u32(1080 if native else 1125)),
-            ('canvas-height', u32(2400 if native else 2436)),
+            ('canvas-width', u32(FB_W if native else 1125)),
+            ('canvas-height', u32(FB_H if native else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -243,14 +261,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('motorola,caprip') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,bengal') + cstr('qcom,khaje') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or __import__('os').environ.get('GTA4L')) else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if (qemu or NO_UFS) else [ufs]))
 
 
 if __name__ == '__main__':
