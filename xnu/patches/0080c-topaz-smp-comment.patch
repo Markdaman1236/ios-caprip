@@ -1,0 +1,14 @@
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..ebf0107 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -18,7 +18,8 @@
+ #define SWEET                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
++ * All eight cores as one homogeneous SMP cluster (topaz: four A53 at
++ * MPIDR 0x0-0x3 + four A73 at 0x100-0x103; sweet: six A55 + two A76):
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+  * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+  * clusters yet).
