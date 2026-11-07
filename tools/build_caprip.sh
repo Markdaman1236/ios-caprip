@@ -37,7 +37,31 @@ DEVICE=caprip PHYSBASE=${PHYSBASE:-0xc0000000} MEMSIZE=${MEMSIZE:-0x80000000} \
 # IOFindBSDRoot matches the rd= string, so this is the only switch needed;
 # the /sweet-emmc ADT node is already emitted for DEVICE=caprip.
 ROOTDEV=${ROOTDEV:-md0}
-CMD="debug=0xc serial=3 cpus=${CPUS:-4} keepsyms=1 -noprogress rd=$ROOTDEV sweettouch=0 sweethw=0 sweetfb_noconsole=0 sweetfb_hz=30"
+# unentitled_ios_sim_launch=1: the iOS launchd on the real root is a
+# PLATFORM_IOS binary, and kern_exec.c rejects those under XNU_TARGET_OS_OSX
+# unless the image carries com.apple.private.security.no-sandbox:
+#   panic: unexpected SIGKILL of launchd (CS_KILLED) ... namespace 9 code 0xe
+#   (OS_REASON_EXEC / EXEC_EXIT_REASON_WRONG_PLATFORM)
+# The TUNABLE that waives it only exists on DEBUG||DEVELOPMENT kernels, which
+# is exactly what we build, so this costs nothing but a boot-arg.
+CMD="debug=0xc serial=3 cpus=${CPUS:-4} keepsyms=1 -noprogress rd=$ROOTDEV sweettouch=0 sweethw=0 sweetfb_noconsole=0 sweetfb_hz=30 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 ${CSARGS:-}"
+# ignition_level=1: launchd's libignition gates each boot stage on a level.
+#   hello / preboot / cryptex-sniff need >= 2, cryptex select+graft >= 3,
+#   and dyld_cache needs >= 1. At the default level it tries to mount a
+#   preboot VOLUME, which a single merged HFS+ root does not have:
+#     libignition: preboot: failed to get preboot device: 25
+#   At level 1 those stages are skipped and dyld_cache still runs, looking
+#   under /System/Library/Caches/com.apple.dyld/ -- where mkiosroot hard
+#   links the cryptex shared cache. Level 0 skips dyld_cache too, so the
+#   cache is never found at all.
+# launchd_unsecure_cache=1: skips the AMFI cdhash check on launchd's XPC
+#   cache ("Using unsecure cache"). Parsed with strtoul base 10, so it
+#   must be a number -- a path silently reads as 0.
+# CSARGS: code-signing relaxations, off by default. The iOS root fails at
+#   unable to create a validated cs_blob object: 85   (EBADEXEC)
+#   dyld cache '(null)' not loaded  ->  libSystem.B.dylib missing
+# BOOT_LINE_LENGTH is 608 on arm64 and mkpayload truncates at 607, so there
+# is room; cs_debug=1 names the vnode whose signature is rejected.
 python3 tools/mkpayload.py "$KERNEL" "$OUT/caprip.adt" "$OUT/payload.bin" \
     --cmdline "$CMD" ${RAMDISK:+--ramdisk "$RAMDISK"}
 
