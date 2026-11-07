@@ -46,7 +46,7 @@ diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,778 @@
 +/*
 + * SWEET internal eMMC root device (read-only).
 + *
@@ -751,6 +751,7 @@ new file mode 100644
 +	unsigned int size = 0;
 +	char want[64] = "userdata";
 +	int error;
++	int tries;
 +
 +	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
@@ -764,7 +765,25 @@ new file mode 100644
 +	se.secsize = DEV_BSIZE;
 +
 +	lck_mtx_lock(&sweet_emmc_lock);
-+	error = emmc_identify();
++	/*
++	 * Identification is retried. This card's exit-from-busy timing
++	 * varies run to run -- the shim probe has reported CMD1 tries=2 and
++	 * tries=5 on identical cold starts -- and a single miss anywhere in
++	 * CMD2/3/9/7/16 used to kill the boot outright with "identification
++	 * failed". That is exactly what happened on the boot after the one
++	 * where this same code identified the card on its first try. Each
++	 * attempt restarts from power-on and CMD0, so a retry is a clean
++	 * restart rather than a patch-up.
++	 */
++	for (tries = 0; tries < 5; tries++) {
++		error = emmc_identify();
++		if (!error) {
++			break;
++		}
++		printf("SWEET EMMC: identify attempt %d failed (%d)\n",
++		    tries + 1, error);
++		delay(50000);
++	}
 +	if (!error) {
 +		error = emmc_find_partition(want);
 +	}
