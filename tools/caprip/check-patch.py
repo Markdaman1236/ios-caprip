@@ -62,8 +62,28 @@ def check(path):
         if not in_hunk:
             continue
         if ln.startswith('--- ') or ln.startswith('+++ '):
-            # file headers only legally appear before the first hunk
-            problems.append('line %d: file header inside a hunk' % n)
+            # A plain diff (no "diff --git") starts each file with "--- a/...",
+            # so a header here is legal *if the open hunk is complete* -- that
+            # is how the next file section begins. An incomplete hunk means a
+            # genuinely truncated patch, which is what this check is for.
+            # Note the ambiguity is inherent to the format: removing a source
+            # line "-- x" also yields "--- x". The hunk counts disambiguate,
+            # exactly as git itself does.
+            if got_old == want_old and got_new == want_new:
+                in_hunk = False
+                if ln.startswith('--- '):
+                    cur_file = ln[4:].strip()
+                continue
+            problems.append('line %d: file header inside an incomplete hunk '
+                            '(declares %d/%d, has %d/%d)'
+                            % (n, want_old, want_new, got_old, got_new))
+            continue
+        # git format-patch ends the diff with a signature block:
+        #     -- <newline> 2.43.0
+        # git ignores it. "-- " is indistinguishable from the removal of a
+        # source line "- ", so again require the open hunk to be complete.
+        if ln.rstrip() == '--' and got_old == want_old and got_new == want_new:
+            in_hunk = False
             continue
         c = ln[:1]
         if c == ' ':
