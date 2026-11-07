@@ -46,7 +46,7 @@ diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,736 @@
+@@ -0,0 +1,759 @@
 +/*
 + * SWEET internal eMMC root device (read-only).
 + *
@@ -660,6 +660,29 @@ new file mode 100644
 +	case DKIOCGETBLOCKCOUNT:
 +		u64 = se.nblocks;
 +		memcpy(data, &u64, sizeof(u64));
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		/*
++		 * Mandatory once DKIOCGETBLOCKSIZE is answered. spec_open()
++		 * reads the block size, flips the device to 512-byte sectors
++		 * to count blocks, then sets it back -- and treats a failure
++		 * of that restore as unrecoverable (error = ENXIO), which
++		 * makes bdevvp() panic "bdevvp failed: open" before the root
++		 * is ever mounted. Returning ENOTTY here is what cost us a
++		 * boot. The device is fixed at DEV_BSIZE, so accept the size
++		 * it already has and refuse any other.
++		 */
++		memcpy(&u32, data, sizeof(u32));
++		return u32 == se.secsize ? 0 : EINVAL;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		u32 = se.secsize;
++		memcpy(data, &u32, sizeof(u32));
++		return 0;
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;			/* read-only: nothing to flush */
++	case DKIOCISSOLIDSTATE:
++		u32 = 1;
++		memcpy(data, &u32, sizeof(u32));
 +		return 0;
 +	case DKIOCISWRITABLE:
 +		u32 = 0;

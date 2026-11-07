@@ -518,9 +518,24 @@ void shim_main(uint64_t dtb)
 	con_skip();
 	/* Hold the result on screen long enough to read and photograph it:
 	 * the panel is the only output channel this board has. */
-	con_str("HOLD", "5 min, then reset to bootloader");
-	delay_ms(300000);
-	reset(40);
+	/*
+	 * Hold forever; do NOT reset.
+	 *
+	 * reset() asks for the bootloader by writing 0x77665500 to the IMEM
+	 * restart_reason, but on bengal that is only half the handshake: the
+	 * caprip DTB's restart@440b000 pairs pshold with tcsr-boot-misc-detect,
+	 * and the bootloader-vs-normal choice is actually latched in the PMIC
+	 * PON SOFT_RB_SPARE register over SPMI (qcom,pon_1/pon_2). Without that
+	 * write the board does a plain reboot -- straight into Android.
+	 *
+	 * That is not merely inconvenient. userdata now holds an HFSX volume,
+	 * and Android's fs_mgr reformats a /data it cannot mount, which would
+	 * silently destroy the root image this probe exists to verify. Hanging
+	 * costs the user one Power+VolDown; resetting can cost 16 GB.
+	 */
+	con_str("HOLD", "done -- Power+VolDn for fastboot");
+	for (;;)
+		__asm__ volatile("wfe");
 #endif
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
