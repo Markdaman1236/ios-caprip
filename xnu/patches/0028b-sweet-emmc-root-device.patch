@@ -13,7 +13,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -784,10 +784,34 @@
+@@ -784,10 +784,39 @@
  		strlcpy(rootName, rdBootVar, rootNameSize);
  		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
  		*oflags = 0;
@@ -34,13 +34,18 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +		}
 +		strlcpy(rootName, rdBootVar, rootNameSize);
 +		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
-+		/* The driver has no write path at all, so asking for a
-+		 * read-write root guarantees EROFS somewhere inside the
-+		 * mount -- it showed up as "jnl: do_jnl_io: strategy err
-+		 * 0x1e" while HFS tried to create the journal. MNT_RDONLY
-+		 * also stops HFS marking the volume dirty and flushing the
-+		 * volume header on the way in. */
-+		*oflags = MNT_RDONLY;
++		/* Must stay 0. This is not a mount-flags word: setconf() tests
++		 * "flags & 1" to mean a NETWORK device and sets
++		 * mountroot = netboot_mountroot when it is set. Passing
++		 * MNT_RDONLY (which is 1) sent vfs_mountroot() down the netboot
++		 * path, so it returned 0 without mounting anything and bsd_init
++		 * then dereferenced an empty mountlist:
++		 *   Kernel data abort at _bsd_init+0x644, far=0x70
++		 *   (mountlist.tqh_first->mnt_flag |= MNT_ROOTFS)
++		 * The root is read-only anyway without asking:
++		 * vfs_rootmountalloc_internal() starts every root mount at
++		 * mnt_flag = MNT_RDONLY | MNT_ROOTFS. */
++		*oflags = 0;
 +		goto iofrootx;
 +	}
 +#endif
