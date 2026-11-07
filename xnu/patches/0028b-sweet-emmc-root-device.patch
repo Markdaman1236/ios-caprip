@@ -13,7 +13,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -784,10 +784,28 @@
+@@ -784,10 +784,34 @@
  		strlcpy(rootName, rdBootVar, rootNameSize);
  		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
  		*oflags = 0;
@@ -34,7 +34,13 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +		}
 +		strlcpy(rootName, rdBootVar, rootNameSize);
 +		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
-+		*oflags = 0;
++		/* The driver has no write path at all, so asking for a
++		 * read-write root guarantees EROFS somewhere inside the
++		 * mount -- it showed up as "jnl: do_jnl_io: strategy err
++		 * 0x1e" while HFS tried to create the journal. MNT_RDONLY
++		 * also stops HFS marking the volume dirty and flushing the
++		 * volume header on the way in. */
++		*oflags = MNT_RDONLY;
 +		goto iofrootx;
 +	}
 +#endif
